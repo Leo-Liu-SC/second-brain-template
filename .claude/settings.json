@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_playwright_playwright__browser_navigate",
+      "mcp__plugin_playwright_playwright__browser_take_screenshot",
+      "mcp__plugin_playwright_playwright__browser_snapshot",
+      "mcp__plugin_playwright_playwright__browser_network_requests",
+      "mcp__plugin_playwright_playwright__browser_network_request",
+      "mcp__plugin_playwright_playwright__browser_find",
+      "mcp__plugin_playwright_playwright__browser_console_messages"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/Utils/lint/lint_wiki.py --changed --hook",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

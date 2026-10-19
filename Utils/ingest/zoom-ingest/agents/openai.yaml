@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zoom Ingest"
+  short_description: "Ingest Zoom meetings into raw notes"
+  default_prompt: "Use $zoom-ingest to save my recent Zoom meetings to raw/meetings with summaries, next steps, and transcripts."

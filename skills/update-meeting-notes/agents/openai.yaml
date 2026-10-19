@@ -1,0 +1,4 @@
+interface:
+  display_name: "Update Meeting Notes"
+  short_description: "Review meeting knowledge before wiki updates"
+  default_prompt: "Use $update-meeting-notes to review selected meeting notes before updating the wiki and (if configured) Todoist."

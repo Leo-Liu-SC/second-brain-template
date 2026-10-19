@@ -1,0 +1,8 @@
+requests
+beautifulsoup4
+markdownify
+trafilatura
+lxml_html_clean
+slack-sdk
+python-dotenv
+yt-dlp
