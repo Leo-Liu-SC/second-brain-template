@@ -34,6 +34,7 @@ The setup script handles everything: credentials, dependencies, Claude Code hook
 cd Utils/ingest
 
 python3 ingest.py zoom --days 30              # Zoom meeting notes (browser SSO)
+python3 ingest.py zoom --days 30 --transcripts # …plus verbatim transcripts with speaker names
 python3 ingest.py slack <channel-url>         # Slack channel
 python3 ingest.py confluence <page-url>       # Confluence page
 python3 ingest.py web <url>                   # Any web page / YouTube
