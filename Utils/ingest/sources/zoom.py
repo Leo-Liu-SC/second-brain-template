@@ -9,7 +9,7 @@ Usage as a module (from scheduler):
 
 Usage as a CLI:
     python3 sources/zoom.py --login
-    python3 sources/zoom.py [--days 30] [--headless]
+    python3 sources/zoom.py [--days 30] [--headless] [--transcripts]
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 from urllib.parse import quote
@@ -133,7 +133,7 @@ def _capture_docs_jwt(page, timeout_ms: int = 30_000) -> str:
     return captured["jwt"]
 
 
-def _hub_fetch(page, jwt: str, url: str) -> dict | str:
+def _hub_fetch(page, jwt: str, url: str, container: str = "drive/browser") -> dict | str:
     js = f"""
     async () => {{
         try {{
@@ -143,7 +143,7 @@ def _hub_fetch(page, jwt: str, url: str) -> dict | str:
                     'Authorization': 'Bearer ' + {json.dumps(jwt)},
                     'Accept': 'application/json, text/plain, */*',
                     'X-Requested-With': 'XMLHttpRequest',
-                    'X-Zm-Docs-Container': 'drive/browser',
+                    'X-Zm-Docs-Container': {json.dumps(container)},
                     'X-Zm-Cluster-Id': 'aw1'
                 }}
             }});
@@ -324,6 +324,8 @@ def list_notes(page, jwt: str, days_back: int) -> list[dict]:
             "id": f.get("id", ""),
             "title": f.get("title", "untitled"),
             "created_at": created_time[:10] if created_time else "unknown",
+            "created_time": created_time,
+            "meeting_id": (f.get("meetingNotes") or {}).get("meetingId", ""),
         })
     return notes
 
@@ -432,6 +434,139 @@ def format_note(title: str, created_at: str, content: str, source: str = "zoom")
     )
 
 
+UNKNOWN_SPEAKER = "Unknown speaker"
+# A notes doc appears when its meeting starts, and AI Companion keeps writing
+# the transcript until shortly after it ends. Notes docs younger than this are
+# left for a later run so a running meeting isn't saved half-transcribed. A
+# heuristic: a meeting longer than this can still be saved incomplete.
+TRANSCRIPT_SETTLE_HOURS = 3
+
+
+def _speaker_labels(transcript: dict) -> dict[str, tuple[str, bool]]:
+    """Map each transcript userId to (display label, is_real_name).
+
+    Precedence per entry: `isUnknown` -> "Unknown speaker" (the username there
+    is just the recording device's owner); else `speakerName`, the diarised
+    label ("Speaker 2") when several people share one device; else `username`,
+    the participant's display name (meeting-room devices show the room name).
+    Only a `username` label counts as a real name.
+    """
+    labels = {}
+    for sp in transcript.get("speakers") or []:
+        if not isinstance(sp, dict) or not sp.get("userId"):
+            continue
+        user_id = str(sp["userId"])
+        if sp.get("isUnknown"):
+            labels[user_id] = (UNKNOWN_SPEAKER, False)
+            continue
+        diarised = (sp.get("speakerName") or "").strip()
+        username = (sp.get("username") or "").strip()
+        if diarised:
+            labels[user_id] = (diarised, False)
+        elif username:
+            labels[user_id] = (username, True)
+    return labels
+
+
+def format_transcript(transcript: dict) -> str:
+    """Render transcript fragments as speaker turns, in the same
+    `### HH:MM:SS — Speaker` shape the zoom-ingest skill writes.
+
+    Zoom returns one item per few seconds of speech; adjacent items from the
+    same speaker are merged into one turn. Someone who rejoins gets a new
+    userId under the same name, so real names are merged across userIds
+    (two different people with the same display name speaking back to back
+    merge too — the label couldn't tell them apart anyway). Unknown, diarised
+    and unnamed speakers stay keyed by userId so distinct voices never merge.
+    """
+    labels = _speaker_labels(transcript)
+    turns = []  # [key, label, start, [texts]]
+    for item in transcript.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        text = " ".join(str(item.get("text") or "").split())
+        if not text:
+            continue
+        user_id = str(item.get("userId") or "")
+        if user_id:
+            label, real_name = labels.get(user_id, (f"Speaker {user_id}", False))
+        else:
+            label, real_name = UNKNOWN_SPEAKER, False
+        key = f"name:{label}" if real_name else f"id:{user_id or len(turns)}"
+        if turns and turns[-1][0] == key:
+            turns[-1][3].append(text)
+        else:
+            turns.append([key, label, str(item.get("startTime") or "?").split(".", 1)[0], [text]])
+
+    if not turns:
+        return ""
+    return "## Transcript\n\n" + "\n\n".join(
+        f"### {start} — {label}\n\n{' '.join(texts)}" for _, label, start, texts in turns
+    )
+
+
+def fetch_transcript(page, jwt: str, note: dict) -> str | None:
+    """Return the rendered AI Companion transcript for a My Notes doc.
+
+    Returns "" when the meeting has no accessible transcript, None when a
+    request failed. The transcript hangs off the notes doc's own
+    `meetingNotes.meetingId`; a meeting summary doc's owning meeting has a
+    different meetingId whose transcript comes back empty, so summaries are
+    not used here.
+    """
+    mid = quote(note["meeting_id"], safe="")
+
+    status = _hub_fetch(page, jwt, f"{DOCS_API_BASE}/meeting/transcript_status?meetingId={mid}",
+                        container="docs/browser")
+    if not isinstance(status, dict) or "error" in status:
+        print(f"  WARN: transcript status failed for {note['title']}: {status.get('error') if isinstance(status, dict) else status}")
+        return None
+    aic = status.get("aicTranscript") or {}
+    if not (aic.get("exist") and status.get("canAccessAicTranscript")):
+        return ""
+
+    result = _hub_fetch(
+        page, jwt,
+        f"{DOCS_API_BASE}/bridge/meeting/transcripts/v2?meetingId={mid}&fileId={quote(note['id'], safe='')}",
+        container="docs/browser",
+    )
+    if not isinstance(result, dict) or "error" in result:
+        print(f"  WARN: transcript fetch failed for {note['title']}: {result.get('error') if isinstance(result, dict) else result}")
+        return None
+    return format_transcript(result)
+
+
+def _save_transcripts(page, jwt: str, notes: list[dict]) -> tuple[int, int, int]:
+    """Write `<note>-transcript.md` for each meeting notes doc. Returns (saved, deferred, failed)."""
+    saved = deferred = failed = 0
+    settle_cutoff = (datetime.now(timezone.utc) - timedelta(hours=TRANSCRIPT_SETTLE_HOURS)).strftime("%Y-%m-%dT%H:%M:%S")
+    for note in notes:
+        if not note.get("meeting_id"):
+            continue  # not a meeting notes doc
+        filename = OUTPUT_DIR / f"{note['created_at']}_{slugify(note['title'])}-transcript.md"
+        if filename.exists():
+            continue
+        if note.get("created_time", "") > settle_cutoff:
+            print(f"  Transcript deferred (meeting may still be in progress): {note['title']}")
+            deferred += 1
+            continue
+        try:
+            content = fetch_transcript(page, jwt, note)
+        except (PWError, PWTimeout, ValueError, TypeError, AttributeError) as e:
+            print(f"  WARN: transcript failed for {note['title']}: {e}")
+            content = None
+        if content is None:
+            failed += 1
+            continue
+        if not content:
+            print(f"  No transcript available: {note['title']}")
+            continue
+        filename.write_text(format_note(note["title"], note["created_at"], content, source="zoom-transcript"))
+        print(f"  Saved transcript ({filename.stat().st_size} bytes): {filename.name}")
+        saved += 1
+    return saved, deferred, failed
+
+
 def _save_items(page, jwt: str, items: list[dict], source: str, filename_suffix: str = "",
                 on_reject=None) -> tuple[int, int, list[str]]:
     saved = skipped = 0
@@ -468,11 +603,14 @@ def _save_items(page, jwt: str, items: list[dict], source: str, filename_suffix:
 
 
 def fetch(days: int = 30, login: bool = False, headless: bool = True,
-          on_reject=None) -> tuple[str, list[str]]:
+          on_reject=None, transcripts: bool = False) -> tuple[str, list[str]]:
     """Run the Zoom sync and return (summary_str, list_of_new_file_paths).
 
     on_reject, if given, is called with a one-line reason for every note that
     was fetched but not written, so a caller can route it into its own log.
+
+    transcripts=True also writes each My Notes doc's verbatim AI Companion
+    transcript, with speaker names, to `<note>-transcript.md`.
 
     Raises NeedsReauth if the session is expired and headless=True.
     """
@@ -539,6 +677,11 @@ def fetch(days: int = 30, login: bool = False, headless: bool = True,
             else:
                 print("No Meeting summaries folder found — skipping.")
 
+            t_saved = t_deferred = t_failed = 0
+            if transcripts:
+                print("Fetching transcripts...")
+                t_saved, t_deferred, t_failed = _save_transcripts(page, jwt, notes)
+
         finally:
             browser.close()
 
@@ -548,10 +691,16 @@ def fetch(days: int = 30, login: bool = False, headless: bool = True,
     suspiciously_small = []
     for fname in (after - before):
         fpath = OUTPUT_DIR / fname
-        if fpath.stat().st_size < 500:
+        if fpath.stat().st_size < 500 and not (transcripts and fname.endswith("-transcript.md")):
             suspiciously_small.append(f"{fname} ({fpath.stat().st_size}B)")
 
     summary = f"Done. {saved} saved, {skipped} already existed."
+    if transcripts:
+        summary += f" {t_saved} transcripts saved."
+        if t_deferred:
+            summary += f" {t_deferred} deferred (meeting too recent)."
+        if t_failed:
+            summary += f" [WARNING: {t_failed} transcript fetches failed]"
     if rejected:
         summary += f" {len(rejected)} rejected (short content)."
     if suspiciously_small:
@@ -565,10 +714,13 @@ def main():
     parser.add_argument("--login", action="store_true", help="Force interactive SSO login")
     parser.add_argument("--days", type=int, default=30, help="Days back to fetch (default: 30)")
     parser.add_argument("--headless", action="store_true", help="Headless mode (after first login)")
+    parser.add_argument("--transcripts", action="store_true",
+                        help="Also save verbatim AI Companion transcripts with speaker names")
     args = parser.parse_args()
 
     try:
-        summary, _ = fetch(days=args.days, login=args.login, headless=args.headless)
+        summary, _ = fetch(days=args.days, login=args.login, headless=args.headless,
+                           transcripts=args.transcripts)
         print(f"\n{summary}")
         sys.exit(0)
     except NeedsReauth as e:

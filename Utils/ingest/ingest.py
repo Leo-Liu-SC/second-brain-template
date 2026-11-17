@@ -49,7 +49,8 @@ def cmd_slack(args):
 def cmd_zoom(args):
     from sources.zoom import fetch, NeedsReauth
     try:
-        summary, new_files = fetch(days=args.days, login=getattr(args, "login", False), headless=not getattr(args, "login", False))
+        summary, new_files = fetch(days=args.days, login=getattr(args, "login", False), headless=not getattr(args, "login", False),
+                                   transcripts=getattr(args, "transcripts", False))
         print(f"✓ Zoom → {summary}")
     except NeedsReauth as e:
         print(f"✗ Zoom needs re-auth: {e}", file=sys.stderr)
@@ -107,6 +108,8 @@ def main():
     p = sub.add_parser("zoom", help="Sync Zoom meeting notes")
     p.add_argument("--days", type=int, default=30, help="How many days back (default: 30)")
     p.add_argument("--login", action="store_true", help="Force interactive SSO login")
+    p.add_argument("--transcripts", action="store_true",
+                   help="Also save verbatim AI Companion transcripts with speaker names")
     p.set_defaults(func=cmd_zoom)
 
     # all
