@@ -21,6 +21,8 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Iterator
+from urllib.parse import quote
 
 from playwright.sync_api import sync_playwright, Error as PWError, TimeoutError as PWTimeout
 
@@ -32,6 +34,8 @@ DOCS_API_BASE = "https://us01docs.zoom.us/api"
 
 EXIT_NEEDS_REAUTH = 2
 MIN_CONTENT_CHARS = 200
+# Backstop for paginated listings: 200 pages x 50 items, far beyond real use.
+MAX_LIST_PAGES = 200
 
 
 def slugify(text):
@@ -193,22 +197,74 @@ def _hub_fetch_post(page, jwt: str, url: str, body: dict) -> dict | str:
     return page.evaluate(js)
 
 
-def _list_folder_children(page, jwt: str, account_id: str, parent_id: str, limit: int = 50) -> list[dict]:
-    result = _hub_fetch_post(page, jwt, f"{DOCS_API_BASE}/hub/files/action/batch_get_children_by_limit", {
-        "parentId": parent_id,
-        "accountId": account_id,
-        "limit": limit,
-        "sortBy": "lastModifiedTime",
-        "desc": True,
-        "fileFilters": [],
-        "foldersMixedWithFiles": True,
-        "flatten": False,
-    })
-    if isinstance(result, dict) and "error" in result:
-        raise RuntimeError(
-            f"Failed to list folder {parent_id}: {result['error']} — body: {result.get('body','')}"
-        )
-    return result.get("children", [])
+def _list_folder_children(page, jwt: str, account_id: str, parent_id: str, limit: int = 50) -> Iterator[dict]:
+    """Yield every child of a Hub folder, newest-modified first.
+
+    The endpoint returns at most `limit` children per call plus a
+    `nextPageToken`, which goes back in the request body as `pageToken`.
+    Pages are fetched lazily, so a caller that stops iterating early
+    (e.g. once it is past its date cutoff) doesn't fetch the rest.
+    """
+    page_token = None
+    seen_tokens = set()
+    for _ in range(MAX_LIST_PAGES):
+        body = {
+            "parentId": parent_id,
+            "accountId": account_id,
+            "limit": limit,
+            "sortBy": "lastModifiedTime",
+            "desc": True,
+            "fileFilters": [],
+            "foldersMixedWithFiles": True,
+            "flatten": False,
+        }
+        if page_token:
+            body["pageToken"] = page_token
+        result = _hub_fetch_post(page, jwt, f"{DOCS_API_BASE}/hub/files/action/batch_get_children_by_limit", body)
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(
+                f"Failed to list folder {parent_id}: {result['error']} — body: {result.get('body','')}"
+            )
+        children = result.get("children") or []
+        yield from children
+        page_token = result.get("nextPageToken")
+        if not children or not page_token:
+            return
+        if page_token in seen_tokens:
+            print(f"  WARN: pagination token for folder {parent_id} stopped advancing — listing may be incomplete.")
+            return
+        seen_tokens.add(page_token)
+    print(f"  WARN: folder {parent_id} still had more pages after {MAX_LIST_PAGES} — listing truncated.")
+
+
+def _list_recent_files(page, jwt: str, limit: int = 50) -> Iterator[dict]:
+    """Yield every entry of the user's Recent list, most recently operated first.
+
+    `/file/recent` pages with a `nextPagingToken` in the response, sent back
+    as the `pagingToken` query parameter. Fetched lazily, like
+    `_list_folder_children`.
+    """
+    paging_token = None
+    seen_tokens = set()
+    for _ in range(MAX_LIST_PAGES):
+        url = f"{DOCS_API_BASE}/file/recent?limit={limit}"
+        if paging_token:
+            url += f"&pagingToken={quote(paging_token, safe='')}"
+        result = _hub_fetch(page, jwt, url)
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(
+                f"Failed to list Zoom Hub notes: {result['error']} — body: {result.get('body','')}"
+            )
+        entries = result.get("recentFiles") or []
+        yield from entries
+        paging_token = result.get("nextPagingToken")
+        if not entries or not paging_token:
+            return
+        if paging_token in seen_tokens:
+            print("  WARN: pagination token for recent files stopped advancing — listing may be incomplete.")
+            return
+        seen_tokens.add(paging_token)
+    print(f"  WARN: recent files still had more pages after {MAX_LIST_PAGES} — listing truncated.")
 
 
 def find_summary_folder_id(page, jwt: str, account_id: str) -> str | None:
@@ -229,6 +285,13 @@ def list_summaries(page, jwt: str, account_id: str, folder_id: str, days_back: i
     for f in _list_folder_children(page, jwt, account_id, folder_id):
         if f.get("fileType") != "doc":
             continue
+        # Children arrive newest-modified first (updatedInfo.time is the
+        # lastModifiedTime sort key), and a doc can't be modified before it
+        # was created, so once one was last modified before the cutoff every
+        # remaining doc was also created before it.
+        updated_time = (f.get("updatedInfo") or {}).get("time", "")
+        if updated_time and updated_time < cutoff:
+            break
         created_time = (f.get("createdInfo") or {}).get("time", "")
         if created_time and created_time < cutoff:
             continue
@@ -242,14 +305,14 @@ def list_summaries(page, jwt: str, account_id: str, folder_id: str, days_back: i
 
 def list_notes(page, jwt: str, days_back: int) -> list[dict]:
     cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
-    result = _hub_fetch(page, jwt, f"{DOCS_API_BASE}/file/recent?limit=50")
-    if isinstance(result, dict) and "error" in result:
-        raise RuntimeError(
-            f"Failed to list Zoom Hub notes: {result['error']} — body: {result.get('body','')}"
-        )
-
     notes = []
-    for entry in result.get("recentFiles", []):
+    for entry in _list_recent_files(page, jwt):
+        # Entries arrive most recently operated first, and a doc can't be
+        # operated on before it exists, so once one was last operated before
+        # the cutoff every remaining doc was also created before it.
+        operated_time = entry.get("lastOperatedTime") or ""
+        if operated_time and operated_time < cutoff:
+            break
         f = entry.get("file") or {}
         if f.get("fileType") not in (None, "doc"):
             continue
